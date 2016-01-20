@@ -1,0 +1,211 @@
+#!/usr/bin/env python
+#
+# Copyright (c) 2013
+# Contributors to the Freedoom project.  All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+#
+#  * Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#  * Neither the name of the freedoom project nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+# PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+# OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+# LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+# NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# ----------------------------------------------------------------------
+#
+# Script to generate menu and intermission screen 'text' graphics for
+# Freedoom, by compositing individual font character graphics together.
+#
+
+from glob import glob
+import re
+import sys
+
+from config import *
+from common import *
+
+# ImageMagick -colorize parameters for colorizing text:
+COLOR_BLUE = (100, 100, 0)
+COLOR_RED = (0, 100, 100)
+COLOR_WHITE = (0, 0, 0)
+
+# Background color for output files.
+BACKGROUND_COLOR = '#00ffff'
+
+# Height of font in pixels.
+FONT_HEIGHT = 15
+FONT_LC_HEIGHT = 15  #12
+
+# If true, the font only has uppercase characters.
+UPPERCASE_FONT = False
+
+# Width of a space character in pixels.
+SPACE_WIDTH = 7
+
+class Font(object):
+	def __init__(self, fontdir, kerning_table={}):
+		self.fontdir = fontdir
+		self.kerning_table = self.compile_kerning_table(kerning_table)
+		self.get_font_widths()
+
+	def compile_kerning_table(self, kerning_table):
+		"""Given a dictionary of kerning patterns, compile Regexps."""
+
+		result = {}
+		for pattern, adjust in kerning_table.items():
+			result[re.compile(pattern)] = adjust
+		return result
+
+	def get_font_widths(self):
+		charfiles = glob('%s/font*.gif' % self.fontdir)
+		self.char_widths = {}
+		for c in range(128):
+			filename = self.char_filename(chr(c))
+			if filename not in charfiles:
+				continue
+			w, _ = get_image_dimensions(filename)
+			self.char_widths[chr(c)] = w
+
+	def __contains__(self, c):
+		return c in self.char_widths
+
+	def char_width(self, c):
+		return self.char_widths[c]
+
+	def char_filename(self, c):
+		return '%s/font%03d.gif' % (self.fontdir, ord(c))
+
+	def kerning_adjust(self, char_1, char_2):
+		"""Get kerning adjustment for pair of characters.
+
+		Zero means no adjustment. A negative value adjusts to the
+		left and a positive value adjusts to the right.
+		"""
+		for pattern, adjust in self.kerning_table.items():
+			if pattern.match(char_1 + char_2):
+				return adjust
+		else:
+			return 0
+
+	def iterate_char_positions(self, text):
+		"""Iterate over characters in string, yielding character with
+		   position it should be placed at in the output file.
+		"""
+		x = 0
+		last_c = ' '
+		for c in text:
+			if c == ' ':
+				x += SPACE_WIDTH
+
+			if c in self:
+				x += self.kerning_adjust(last_c, c)
+
+				yield c, x
+
+				# Characters overlap by one pixel.
+				x += self.char_width(c) - 1
+
+			last_c = c
+
+		# We need to add back the missing pixel from the right side
+		# of the last char.
+		x += 1
+		yield None, x
+
+	def text_width(self, text):
+		"""Given a string of text, get text width in pixels."""
+		for c, x in self.iterate_char_positions(text):
+			if c is None:
+				return x
+
+	def _make_command_line(self, text, color):
+		"""Command line construction helper, used in render functions"""
+		width = self.text_width(text)
+
+		if LOWERCASE_RE.match(text):
+			height = FONT_LC_HEIGHT
+		else:
+			height = FONT_HEIGHT
+
+		command_line = [
+			CONVERT_COMMAND,
+			'-size', '%ix%i' % (width, height),
+			'xc:none',
+		]
+
+		for c, x in self.iterate_char_positions(text):
+			if c is None:
+				break
+
+			filename = self.char_filename(c)
+			command_line.extend([
+				'-draw',
+				'image over %i,%i 0,0 %s' %
+				    (x, height - FONT_HEIGHT, filename)
+			])
+
+		command_line.extend([
+			'-colorize', '%i,%i,%i,0' % color,
+		])
+
+		return command_line
+
+	def render_text(self, text, output_filename,
+	                color=COLOR_WHITE, bgcolor=BACKGROUND_COLOR):
+		"""Render text to a file with the given background color."""
+
+		if UPPERCASE_FONT:
+			text = text.upper()
+		command_line = self._make_command_line(text, color)
+
+		if bgcolor is not None:
+			command_line.extend([
+				'-background', bgcolor, '-flatten'])
+
+		command_line.append(output_filename)
+
+		invoke_command(command_line)
+
+def generate_graphics(graphics, color=COLOR_WHITE, bgcolor=BACKGROUND_COLOR):
+	for name, text in sorted(graphics.items()):
+		print("# %s.gif: '%s'" % (name, text))
+		font.render_text(text, '%s.gif' % name,
+		                 color=color, bgcolor=bgcolor)
+
+def generate_kerning_test():
+	pairs = []
+	for c1 in sorted(font.char_widths):
+		char1 = "%c" % c1
+		for c2 in sorted(font.char_widths):
+			char2 = "%c" % c2
+			if font.kerning_adjust(char1, char2) != 0:
+				pairs.append(char1 + char2)
+
+	font.render_text(" ".join(pairs), "kerning.gif")
+
+font = Font('fontchars', kerning_table=FONT_KERNING_RULES)
+
+# Enable to generate test image file for tweaking kerning values:
+#generate_kerning_test()
+
+generate_graphics(red_graphics, color=COLOR_RED)
+generate_graphics(blue_graphics, color=COLOR_BLUE)
+generate_graphics(white_graphics, color=COLOR_WHITE)
+
